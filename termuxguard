@@ -1,0 +1,81 @@
+#!/bin/bash
+# TermuxGuard Command-line Interface
+# A wrapper for the Python CLI for easier use in Termux
+
+# Terminal colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Default commands
+if [ "$1" == "run" ] || [ "$1" == "start" ]; then
+    # Run the service in foreground or start in background
+    if [ "$2" == "bg" ] || [ "$2" == "background" ]; then
+        "$SCRIPT_DIR/scripts/termux_service.sh" start
+    else
+        cd "$SCRIPT_DIR" && python main.py
+    fi
+elif [ "$1" == "stop" ]; then
+    # Stop the service
+    "$SCRIPT_DIR/scripts/termux_service.sh" stop
+elif [ "$1" == "scan" ]; then
+    # Run a scan with the Python CLI
+    shift
+    cd "$SCRIPT_DIR" && python termux_cli.py scan "$@"
+elif [ "$1" == "status" ]; then
+    # Check status of the service and security
+    if [ "$2" == "service" ]; then
+        "$SCRIPT_DIR/scripts/termux_service.sh" status
+    else
+        cd "$SCRIPT_DIR" && python termux_cli.py status
+    fi
+elif [ "$1" == "enable" ] || [ "$1" == "disable" ]; then
+    # Enable or disable a feature
+    cmd="$1"
+    feature="$2"
+    cd "$SCRIPT_DIR" && python termux_cli.py "$cmd" "$feature"
+elif [ "$1" == "version" ] || [ "$1" == "--version" ] || [ "$1" == "-v" ]; then
+    # Show version
+    cd "$SCRIPT_DIR" && python termux_cli.py version
+elif [ "$1" == "install" ]; then
+    # Install dependencies
+    "$SCRIPT_DIR/scripts/install_dependencies.sh"
+elif [ "$1" == "help" ] || [ "$1" == "--help" ] || [ "$1" == "-h" ] || [ -z "$1" ]; then
+    # Show help
+    echo -e "${BLUE}TermuxGuard - Termux AntiMalware Command Line Interface${NC}"
+    echo
+    echo -e "${YELLOW}Usage:${NC}"
+    echo -e "  ${CYAN}termuxguard run${NC}                 - Run the service in foreground"
+    echo -e "  ${CYAN}termuxguard start [bg]${NC}          - Start the service (optionally in background)"
+    echo -e "  ${CYAN}termuxguard stop${NC}                - Stop the service"
+    echo -e "  ${CYAN}termuxguard scan [directory]${NC}    - Scan a directory"
+    echo -e "  ${CYAN}termuxguard status${NC}              - Show security status"
+    echo -e "  ${CYAN}termuxguard status service${NC}      - Check if service is running"
+    echo -e "  ${CYAN}termuxguard enable FEATURE${NC}      - Enable a security feature"
+    echo -e "  ${CYAN}termuxguard disable FEATURE${NC}     - Disable a security feature"
+    echo -e "  ${CYAN}termuxguard install${NC}             - Install dependencies"
+    echo -e "  ${CYAN}termuxguard version${NC}             - Show version information"
+    echo -e "  ${CYAN}termuxguard help${NC}                - Show this help"
+    echo
+    echo -e "${YELLOW}Features:${NC} firewall, filter, ai, background"
+    echo
+    echo -e "${YELLOW}Examples:${NC}"
+    echo -e "  ${CYAN}termuxguard scan /sdcard/Download${NC}"
+    echo -e "  ${CYAN}termuxguard enable firewall${NC}"
+    echo -e "  ${CYAN}termuxguard disable ai${NC}"
+    echo
+    echo -e "${YELLOW}Web Interface:${NC}"
+    echo -e "  The web interface is available at ${CYAN}http://localhost:5000${NC} when the service is running"
+else
+    echo -e "${RED}Unknown command: $1${NC}"
+    echo -e "Run ${CYAN}termuxguard help${NC} for usage information"
+    exit 1
+fi
+
+exit 0
