@@ -1,247 +1,294 @@
 import os
-import subprocess
 import logging
-import ipaddress
-import re
+import json
+import threading
 import time
 from datetime import datetime
+import ipaddress
+from utils import get_termux_path
 
-from app import db
-from models import FirewallRule, SecurityLog
-import config
-
-# Setup logger
+# Configure logging
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-def is_root():
-    """Check if the script is running with root privileges."""
-    return os.geteuid() == 0
+# Global variables
+firewall_rules = []
+firewall_enabled = True
+firewall_lock = threading.Lock()
+RULES_FILE = os.path.join(get_termux_path('data'), 'firewall_rules.json')
 
-def execute_command(command):
-    """Execute a shell command and return the output."""
+def load_rules_from_db():
+    """Load firewall rules from the database."""
     try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        return result.stdout.strip()
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Command execution failed: {e.stderr}")
-        return None
+        from app import db
+        from models import FirewallRule
+        
+        with firewall_lock:
+            global firewall_rules
+            rules_from_db = FirewallRule.query.filter_by(is_active=True).order_by(FirewallRule.priority).all()
+            
+            # Convert DB rules to dictionary format for internal use
+            firewall_rules = [
+                {
+                    'id': rule.id,
+                    'rule_type': rule.rule_type,
+                    'target': rule.target,
+                    'action': rule.action,
+                    'priority': rule.priority,
+                    'description': rule.description
+                }
+                for rule in rules_from_db
+            ]
+            
+            # Save rules to file for fallback
+            save_rules_to_file()
+            
+            logger.info(f"Loaded {len(firewall_rules)} rules from database")
+            return firewall_rules
+    except Exception as e:
+        logger.error(f"Failed to load rules from database: {e}")
+        # Fallback to file-based rules
+        return load_rules_from_file()
 
-def is_iptables_available():
-    """Check if iptables is available on the system."""
-    result = execute_command("which iptables")
-    return bool(result)
-
-def is_valid_ip(ip):
-    """Validate if the string is a valid IP address."""
+def load_rules_from_file():
+    """Load firewall rules from a file as fallback."""
     try:
-        ipaddress.ip_address(ip)
-        return True
-    except ValueError:
-        return False
+        if os.path.exists(RULES_FILE):
+            with open(RULES_FILE, 'r') as f:
+                global firewall_rules
+                with firewall_lock:
+                    firewall_rules = json.load(f)
+                logger.info(f"Loaded {len(firewall_rules)} rules from file")
+                return firewall_rules
+        else:
+            logger.warning("Rules file not found, using default rules")
+            return create_default_rules()
+    except Exception as e:
+        logger.error(f"Failed to load rules from file: {e}")
+        return create_default_rules()
 
-def is_valid_port(port):
-    """Validate if the port number is valid."""
+def save_rules_to_file():
+    """Save firewall rules to a file for persistence."""
     try:
-        port = int(port)
-        return 0 < port < 65536
-    except (ValueError, TypeError):
-        return False
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(RULES_FILE), exist_ok=True)
+        
+        with open(RULES_FILE, 'w') as f:
+            json.dump(firewall_rules, f, indent=2)
+        logger.debug("Rules saved to file")
+    except Exception as e:
+        logger.error(f"Failed to save rules to file: {e}")
 
-def init_firewall():
-    """Initialize the firewall with default settings."""
-    if not is_iptables_available():
-        logger.error("iptables is not available. Firewall cannot be initialized.")
-        return False
+def create_default_rules():
+    """Create default firewall rules."""
+    default_rules = [
+        {
+            'id': 1,
+            'rule_type': 'ip',
+            'target': '0.0.0.0/0',  # All IPs
+            'action': 'allow',
+            'priority': 100,  # Lowest priority (applied last)
+            'description': 'Default allow rule'
+        },
+        {
+            'id': 2,
+            'rule_type': 'port',
+            'target': '22',
+            'action': 'log',
+            'priority': 10,
+            'description': 'Log SSH attempts'
+        },
+        {
+            'id': 3,
+            'rule_type': 'domain',
+            'target': 'malicious.example.com',
+            'action': 'block',
+            'priority': 1,  # High priority
+            'description': 'Block known malicious domain'
+        }
+    ]
+    
+    with firewall_lock:
+        global firewall_rules
+        firewall_rules = default_rules
+        save_rules_to_file()
+    
+    logger.info("Created default firewall rules")
+    return default_rules
 
+def initialize_firewall():
+    """Initialize the firewall system."""
     try:
-        # Flush existing rules
-        execute_command("iptables -F")
-        execute_command("iptables -X")
+        # Load firewall rules
+        load_rules_from_db()
         
-        # Set default policies
-        execute_command("iptables -P INPUT ACCEPT")
-        execute_command("iptables -P FORWARD ACCEPT")
-        execute_command("iptables -P OUTPUT ACCEPT")
+        # Create dedicated directory for firewall logs
+        os.makedirs(os.path.join(get_termux_path('data'), 'logs'), exist_ok=True)
         
-        # Allow established connections
-        execute_command("iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT")
-        
-        # Allow localhost
-        execute_command("iptables -A INPUT -i lo -j ACCEPT")
-        
-        # Apply rules from database
-        update_firewall_rules()
-        
-        # Log initialization
-        log_entry = SecurityLog(
-            event_type="FIREWALL_INIT",
-            description="Firewall initialized successfully",
-            severity="INFO",
-            timestamp=datetime.now()
-        )
-        db.session.add(log_entry)
-        db.session.commit()
+        global firewall_enabled
+        firewall_enabled = True
         
         logger.info("Firewall initialized successfully")
         return True
     except Exception as e:
-        logger.error(f"Failed to initialize firewall: {str(e)}")
+        logger.error(f"Failed to initialize firewall: {e}")
         return False
 
-def update_firewall_rules():
-    """Apply firewall rules from the database."""
-    if not is_iptables_available():
-        logger.error("iptables is not available. Cannot update firewall rules.")
-        return False
-        
+def toggle_firewall_status(enabled=True):
+    """Enable or disable the firewall."""
+    global firewall_enabled
+    firewall_enabled = enabled
+    
+    # Log the status change
     try:
-        # Get all enabled rules from database
-        rules = FirewallRule.query.filter_by(enabled=True).all()
+        from app import db
+        from models import SecurityLog
         
-        # Clear existing custom rules (keep the basic ones)
-        execute_command("iptables -F INPUT")
-        execute_command("iptables -F OUTPUT")
-        
-        # Allow established connections
-        execute_command("iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT")
-        
-        # Allow localhost
-        execute_command("iptables -A INPUT -i lo -j ACCEPT")
-        
-        # Apply each rule
-        for rule in rules:
-            rule_cmd = build_iptables_rule(rule)
-            if rule_cmd:
-                execute_command(rule_cmd)
-                
-        # Set default policy based on configuration
-        default_action = "ACCEPT" if config.DEFAULT_FIREWALL_ACTION == "ALLOW" else "DROP"
-        execute_command(f"iptables -A INPUT -j {default_action}")
-        
-        logger.info(f"Applied {len(rules)} firewall rules")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to update firewall rules: {str(e)}")
-        return False
-
-def build_iptables_rule(rule):
-    """Build an iptables command from a rule object."""
-    try:
-        # Validate rule
-        if rule.protocol not in ["tcp", "udp", "icmp", "all"]:
-            logger.warning(f"Invalid protocol in rule {rule.id}: {rule.protocol}")
-            return None
-            
-        # Build basic command
-        cmd = f"iptables -A INPUT"
-        
-        # Add protocol
-        if rule.protocol != "all":
-            cmd += f" -p {rule.protocol}"
-            
-        # Add source IP if specified
-        if rule.source_ip and is_valid_ip(rule.source_ip):
-            cmd += f" -s {rule.source_ip}"
-            
-        # Add destination IP if specified
-        if rule.destination_ip and is_valid_ip(rule.destination_ip):
-            cmd += f" -d {rule.destination_ip}"
-            
-        # Add port if specified and protocol is tcp/udp
-        if rule.port and is_valid_port(rule.port) and rule.protocol in ["tcp", "udp"]:
-            cmd += f" --dport {rule.port}"
-            
-        # Add action
-        action = "ACCEPT" if rule.action == "ALLOW" else "DROP"
-        cmd += f" -j {action}"
-        
-        # Add logging if enabled
-        if config.FIREWALL_LOG_BLOCKED and action == "DROP":
-            log_cmd = cmd.replace(f" -j {action}", f" -j LOG --log-prefix \"[TERMUX-FIREWALL-BLOCKED] \"")
-            return [log_cmd, cmd]
-            
-        return cmd
-    except Exception as e:
-        logger.error(f"Failed to build iptables rule: {str(e)}")
-        return None
-
-def get_active_connections():
-    """Get list of active network connections."""
-    try:
-        netstat_output = execute_command("netstat -tuln")
-        connections = []
-        
-        if netstat_output:
-            # Parse netstat output
-            lines = netstat_output.split('\n')
-            for line in lines[2:]:  # Skip header lines
-                parts = re.split(r'\s+', line.strip())
-                if len(parts) >= 5:
-                    proto = parts[0]
-                    local_address = parts[3]
-                    state = parts[5] if len(parts) > 5 else "UNKNOWN"
-                    
-                    connections.append({
-                        "protocol": proto,
-                        "local_address": local_address,
-                        "state": state
-                    })
-        
-        return connections
-    except Exception as e:
-        logger.error(f"Failed to get active connections: {str(e)}")
-        return []
-
-def add_temporary_block(ip, duration=300):
-    """Temporarily block an IP address for specified duration (in seconds)."""
-    if not is_valid_ip(ip):
-        logger.error(f"Invalid IP address: {ip}")
-        return False
-        
-    try:
-        # Add rule to block the IP
-        execute_command(f"iptables -I INPUT -s {ip} -j DROP")
-        
-        # Log the block
-        log_entry = SecurityLog(
-            event_type="TEMP_IP_BLOCK",
-            description=f"Temporarily blocked IP {ip} for {duration} seconds",
-            severity="MEDIUM",
-            timestamp=datetime.now()
+        log = SecurityLog(
+            log_type='firewall',
+            severity='info',
+            source='system',
+            message=f"Firewall {'enabled' if enabled else 'disabled'}",
+            details=json.dumps({'timestamp': datetime.now().isoformat()})
         )
-        db.session.add(log_entry)
+        db.session.add(log)
         db.session.commit()
-        
-        # Schedule rule removal
-        def remove_block():
-            time.sleep(duration)
-            execute_command(f"iptables -D INPUT -s {ip} -j DROP")
+    except Exception as e:
+        logger.error(f"Failed to log firewall status change: {e}")
+    
+    return firewall_enabled
+
+def apply_rule(rule):
+    """Apply a new or updated firewall rule."""
+    try:
+        with firewall_lock:
+            # Check if the rule already exists (update case)
+            for i, existing_rule in enumerate(firewall_rules):
+                if existing_rule['id'] == rule.id:
+                    # Update the existing rule
+                    firewall_rules[i] = {
+                        'id': rule.id,
+                        'rule_type': rule.rule_type,
+                        'target': rule.target,
+                        'action': rule.action,
+                        'priority': rule.priority,
+                        'description': rule.description
+                    }
+                    logger.info(f"Updated rule {rule.id}")
+                    # Re-sort rules by priority
+                    firewall_rules.sort(key=lambda x: x['priority'])
+                    save_rules_to_file()
+                    return True
             
-            # Log the unblock
-            log_entry = SecurityLog(
-                event_type="TEMP_IP_UNBLOCK",
-                description=f"Temporary block expired for IP {ip}",
-                severity="INFO",
-                timestamp=datetime.now()
-            )
-            db.session.add(log_entry)
-            db.session.commit()
-            
-        # Start thread to remove the block after duration
-        import threading
-        unblock_thread = threading.Thread(target=remove_block)
-        unblock_thread.daemon = True
-        unblock_thread.start()
-        
-        logger.info(f"Added temporary block for IP {ip} for {duration} seconds")
+            # If rule doesn't exist, add it
+            firewall_rules.append({
+                'id': rule.id,
+                'rule_type': rule.rule_type,
+                'target': rule.target,
+                'action': rule.action,
+                'priority': rule.priority,
+                'description': rule.description
+            })
+            # Sort rules by priority
+            firewall_rules.sort(key=lambda x: x['priority'])
+            logger.info(f"Added new rule {rule.id}")
+            save_rules_to_file()
+            return True
+    except Exception as e:
+        logger.error(f"Failed to apply rule: {e}")
+        return False
+
+def remove_rule(rule_id):
+    """Remove a firewall rule."""
+    try:
+        with firewall_lock:
+            global firewall_rules
+            # Filter out the rule with the given ID
+            firewall_rules = [rule for rule in firewall_rules if rule['id'] != rule_id]
+            save_rules_to_file()
+            logger.info(f"Removed rule {rule_id}")
         return True
     except Exception as e:
-        logger.error(f"Failed to add temporary block: {str(e)}")
+        logger.error(f"Failed to remove rule: {e}")
         return False
+
+def check_packet_against_rules(packet_data):
+    """Check a packet against the firewall rules and determine the action."""
+    if not firewall_enabled:
+        return 'allow'
+    
+    with firewall_lock:
+        for rule in firewall_rules:
+            # Skip inactive rules
+            if not rule.get('is_active', True):
+                continue
+            
+            # Match by rule type
+            if rule['rule_type'] == 'ip':
+                # Check if src_ip or dst_ip matches the IP rule
+                if 'src_ip' in packet_data and match_ip(packet_data['src_ip'], rule['target']):
+                    return rule['action']
+                if 'dst_ip' in packet_data and match_ip(packet_data['dst_ip'], rule['target']):
+                    return rule['action']
+            
+            elif rule['rule_type'] == 'port':
+                # Check if src_port or dst_port matches the port rule
+                if 'src_port' in packet_data and str(packet_data['src_port']) == rule['target']:
+                    return rule['action']
+                if 'dst_port' in packet_data and str(packet_data['dst_port']) == rule['target']:
+                    return rule['action']
+            
+            elif rule['rule_type'] == 'domain' and 'dns_query' in packet_data:
+                # Check if dns_query contains the domain
+                if packet_data['dns_query'] and rule['target'] in packet_data['dns_query']:
+                    return rule['action']
+    
+    # Default action if no rule matches
+    return 'allow'
+
+def match_ip(ip, target):
+    """Check if an IP matches a target IP or CIDR range."""
+    try:
+        # Handle single IP match
+        if '/' not in target:
+            return ip == target
+        
+        # Handle CIDR range match
+        ip_obj = ipaddress.ip_address(ip)
+        network = ipaddress.ip_network(target, strict=False)
+        return ip_obj in network
+    except Exception as e:
+        logger.error(f"Error matching IP {ip} against {target}: {e}")
+        return False
+
+def get_firewall_status():
+    """Get the current firewall status and statistics."""
+    status = {
+        'enabled': firewall_enabled,
+        'rules_count': len(firewall_rules),
+        'last_updated': datetime.now().isoformat()
+    }
+    return status
+
+# Standalone execution for testing
+if __name__ == "__main__":
+    print("Initializing firewall in standalone mode...")
+    initialize_firewall()
+    
+    # Test packet
+    test_packet = {
+        'src_ip': '192.168.1.100',
+        'dst_ip': '8.8.8.8',
+        'protocol': 'UDP',
+        'src_port': 53212,
+        'dst_port': 53,
+        'dns_query': 'malicious.example.com'
+    }
+    
+    action = check_packet_against_rules(test_packet)
+    print(f"Action for test packet: {action}")
+    
+    # Print current rules
+    print("Current firewall rules:")
+    for rule in firewall_rules:
+        print(f"  {rule['priority']}: {rule['rule_type']} {rule['target']} -> {rule['action']}")
